@@ -1,6 +1,9 @@
 """
-GPU-Accelerated ML Intrusion Detection System
-Starter file - Data preprocessing
+Preprocess network-traffic data for the intrusion detection system.
+
+Reads a CSV, turns text columns into numbers, scales the features,
+and splits the rows into train and test sets. The last column is the label
+(normal vs attack, or a specific attack type).
 """
 
 import pandas as pd

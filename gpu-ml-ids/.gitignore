@@ -1,0 +1,8 @@
+﻿__pycache__/
+*.py[cod]
+.env
+data/*.csv
+data/*.zip
+models/*.pth
+models/*.pt
+.ipynb_checkpoints/

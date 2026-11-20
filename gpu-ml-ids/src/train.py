@@ -28,7 +28,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 BATCH_SIZE = 2048
 EPOCHS = 5
-MAX_SAMPLES = 200_000
+MAX_SAMPLES = 1_000_000
 
 
 class IDSModel(nn.Module):

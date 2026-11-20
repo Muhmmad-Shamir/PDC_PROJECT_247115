@@ -6,13 +6,23 @@ from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    confusion_matrix
+)
+import matplotlib.pyplot as plt
 import joblib
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data" / "processed"
 MODEL_DIR = PROJECT_ROOT / "models"
+RESULTS_DIR = PROJECT_ROOT / "results"
+
 MODEL_DIR.mkdir(exist_ok=True)
+RESULTS_DIR.mkdir(exist_ok=True)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -183,17 +193,52 @@ def main():
             predictions.extend(preds.cpu().numpy().flatten())
             actual.extend(batch_y.numpy().flatten())
 
-    print("\n--- TEST RESULTS ---")
-    print("Accuracy :", accuracy_score(actual, predictions))
-    print("Precision:", precision_score(actual, predictions, zero_division=0))
-    print("Recall   :", recall_score(actual, predictions, zero_division=0))
-    print("F1 Score:", f1_score(actual, predictions, zero_division=0))
+  
+   
 
-    torch.save(model.state_dict(), MODEL_DIR / "ids_model.pth")
-    joblib.dump(scaler, MODEL_DIR / "scaler.pkl")
 
-    print("\nModel saved successfully.")
-    print("Training completed!")
+        print("\n--- TEST RESULTS ---")
+        print("Accuracy :", accuracy_score(actual, predictions))
+        print("Precision:", precision_score(actual, predictions, zero_division=0))
+        print("Recall   :", recall_score(actual, predictions, zero_division=0))
+        print("F1 Score:", f1_score(actual, predictions, zero_division=0))
+
+        # Confusion matrix
+        cm = confusion_matrix(actual, predictions, labels=[0, 1])
+
+        print("\n--- CONFUSION MATRIX ---")
+        print("                 Predicted")
+        print("              Benign  Attack")
+        print(f"Actual Benign   {cm[0][0]:>6}  {cm[0][1]:>6}")
+        print(f"Actual Attack   {cm[1][0]:>6}  {cm[1][1]:>6}")
+
+        # Plot confusion matrix
+        plt.figure(figsize=(6, 5))
+        plt.imshow(cm)
+        plt.title("GPU-ML-IDS Confusion Matrix")
+        plt.xticks([0, 1], ["Benign", "Attack"])
+        plt.yticks([0, 1], ["Benign", "Attack"])
+        plt.xlabel("Predicted Label")
+        plt.ylabel("Actual Label")
+
+        for i in range(2):
+            for j in range(2):
+                plt.text(j, i, str(cm[i, j]), ha="center", va="center")
+
+        plt.tight_layout()
+
+        cm_path = RESULTS_DIR / "confusion_matrix.png"
+        plt.savefig(cm_path, dpi=300)
+        plt.close()
+
+        print("Confusion matrix saved:", cm_path)
+
+        # Save model and scaler
+        torch.save(model.state_dict(), MODEL_DIR / "ids_model.pth")
+        joblib.dump(scaler, MODEL_DIR / "scaler.pkl")
+
+        print("\nModel saved successfully.")
+        print("Training completed!")
 
 
 if __name__ == "__main__":

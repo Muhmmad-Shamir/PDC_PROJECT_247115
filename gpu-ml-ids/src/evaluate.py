@@ -29,6 +29,8 @@ import joblib
 scaler = joblib.load(MODEL_DIR / "scaler.pkl")
 
 X_test = scaler.transform(X_test)
+X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
+X_test = X_test.astype(np.float32)
 
 # Define model architecture
 class IDSModel(nn.Module):
@@ -67,6 +69,9 @@ X_test_tensor = torch.tensor(X_test, dtype=torch.float32).to(device)
 with torch.no_grad():
     outputs = model(X_test_tensor)
     predictions = (torch.sigmoid(outputs) >= 0.5).cpu().numpy().astype(int).flatten()
+    print("Prediction counts:", np.unique(predictions, return_counts=True))
+    print("Actual counts:", np.unique(y_test, return_counts=True))
+    print("Mean probability:", torch.sigmoid(outputs).mean().item())
 
 # Calculate metrics
 print("\n--- Model Evaluation ---")

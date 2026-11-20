@@ -54,30 +54,39 @@ def load_sample():
 
     files = sorted(DATA_DIR.glob("clean_*.csv"))
 
+    SAMPLES_PER_CHUNK = 10_000
+
     for file in files:
         print("Reading:", file.name)
 
         for chunk in pd.read_csv(file, chunksize=100_000):
+
+            remaining = MAX_SAMPLES - total
+
+            if remaining <= 0:
+                break
+
+            sample_size = min(SAMPLES_PER_CHUNK, len(chunk), remaining)
+
             sample = chunk.sample(
-                n=min(500, len(chunk)),
+                n=sample_size,
                 random_state=42
             )
 
             samples.append(sample)
             total += len(sample)
 
-            if total >= MAX_SAMPLES:
-                break
+            print(f"Samples collected: {total:,}")
 
         if total >= MAX_SAMPLES:
             break
 
     data = pd.concat(samples, ignore_index=True)
-    print("\nSample size:", len(data))
+
+    print("\nTotal dataset sample:", len(data))
     print("Labels:\n", data["Label"].value_counts())
 
     return data
-
 
 def main():
     print("Device:", DEVICE)

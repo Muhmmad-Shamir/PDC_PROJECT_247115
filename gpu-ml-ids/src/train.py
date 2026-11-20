@@ -95,10 +95,21 @@ def main():
         random_state=42,
         stratify=y
     )
+    np.savez_compressed(
+    RESULTS_DIR / "test_data.npz",
+    X_test=X_test,
+    y_test=y_test
+)
 
     # Clip extreme values using training data percentiles
     lower = np.percentile(X_train, 1, axis=0)
     upper = np.percentile(X_train, 99, axis=0)
+
+    np.savez(
+    MODEL_DIR / "clip_bounds.npz",
+    lower=lower,
+    upper=upper
+)
 
     X_train = np.clip(X_train, lower, upper)
     X_test = np.clip(X_test, lower, upper)

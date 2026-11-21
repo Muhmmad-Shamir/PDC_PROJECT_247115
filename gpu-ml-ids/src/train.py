@@ -54,7 +54,7 @@ def load_sample():
 
     files = sorted(DATA_DIR.glob("clean_*.csv"))
 
-    SAMPLES_PER_CHUNK = 10_000
+    SAMPLES_PER_CHUNK = 100_000
 
     for file in files:
         print("Reading:", file.name)
@@ -87,6 +87,7 @@ def load_sample():
     print("Labels:\n", data["Label"].value_counts())
 
     return data
+
 
 def main():
     print("Device:", DEVICE)

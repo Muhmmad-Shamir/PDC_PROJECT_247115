@@ -1,265 +1,239 @@
+"""Train the SAME IDS network on CPU and GPU and compare actual training times.
+
+First run: python src/preprocess.py --samples 2000000
+Then run:  python src/train.py --epochs 25
+
+Uses cached data/prepared/*.npy. Does not load or clean CSV files.
+Results: results/training_comparison.{csv,json,png}.
+"""
+
+import argparse
+import csv
+import json
+import os
+import time
 from pathlib import Path
-import pandas as pd
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 from torch import nn
 from torch.utils.data import DataLoader, TensorDataset
-from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    accuracy_score,
-    precision_score,
-    recall_score,
-    f1_score,
-    confusion_matrix
-)
-import matplotlib.pyplot as plt
-import joblib
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data" / "processed"
-MODEL_DIR = PROJECT_ROOT / "models"
-RESULTS_DIR = PROJECT_ROOT / "results"
-
-MODEL_DIR.mkdir(exist_ok=True)
-RESULTS_DIR.mkdir(exist_ok=True)
-
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-BATCH_SIZE = 2048
-EPOCHS = 5
-MAX_SAMPLES = 1_000_000
+ROOT = Path(__file__).resolve().parent.parent
+PREPARED_DIR = ROOT / "data" / "prepared"
+RESULTS_DIR = ROOT / "results"
+MODELS_DIR = ROOT / "models"
+SEED = 42
 
 
-class IDSModel(nn.Module):
+class IDSNet(nn.Module):
+    """Larger network for a meaningful training workload."""
     def __init__(self, input_size):
         super().__init__()
         self.network = nn.Sequential(
-            nn.Linear(input_size, 128),
+            nn.Linear(input_size, 512),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(128, 64),
+            nn.Linear(512, 256),
             nn.ReLU(),
-            nn.Dropout(0.2),
-            nn.Linear(64, 1)
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1),
         )
 
     def forward(self, x):
         return self.network(x)
 
 
-def load_sample():
-    samples = []
-    total = 0
-
-    files = sorted(DATA_DIR.glob("clean_*.csv"))
-
-    SAMPLES_PER_CHUNK = 100_000
-
-    for file in files:
-        print("Reading:", file.name)
-
-        for chunk in pd.read_csv(file, chunksize=100_000):
-
-            remaining = MAX_SAMPLES - total
-
-            if remaining <= 0:
-                break
-
-            sample_size = min(SAMPLES_PER_CHUNK, len(chunk), remaining)
-
-            sample = chunk.sample(
-                n=sample_size,
-                random_state=42
+def load_prepared_data():
+    required = ["X_train.npy", "y_train.npy", "X_test.npy", "y_test.npy", "dataset_info.json"]
+    for name in required:
+        if not (PREPARED_DIR / name).exists():
+            raise FileNotFoundError(
+                f"Missing {PREPARED_DIR / name}. Run src/preprocess.py first."
             )
+    # Memory mapping avoids eagerly copying prepared millions of rows into RAM.
+    x_train = np.load(PREPARED_DIR / "X_train.npy", mmap_mode="r+")
+    y_train = np.load(PREPARED_DIR / "y_train.npy", mmap_mode="r+")
+    x_test = np.load(PREPARED_DIR / "X_test.npy", mmap_mode="r+")
+    y_test = np.load(PREPARED_DIR / "y_test.npy", mmap_mode="r+")
+    with open(PREPARED_DIR / "dataset_info.json", encoding="utf-8") as file:
+        info = json.load(file)
+    if x_train.shape[1] != x_test.shape[1] or len(x_train) != len(y_train):
+        raise ValueError("Prepared data shapes do not match")
+    train_set = TensorDataset(torch.from_numpy(x_train), torch.from_numpy(y_train).view(-1, 1))
+    test_set = TensorDataset(torch.from_numpy(x_test), torch.from_numpy(y_test).view(-1, 1))
+    return train_set, test_set, info
 
-            samples.append(sample)
-            total += len(sample)
 
-            print(f"Samples collected: {total:,}")
+def train_on_device(device, initial_state, train_set, test_set, epochs, batch_size, input_size):
+    torch.manual_seed(SEED)
+    model = IDSNet(input_size)
+    model.load_state_dict(initial_state)
+    model = model.to(device)
 
-        if total >= MAX_SAMPLES:
-            break
+    positives = float(train_set.tensors[1].sum().item())
+    negatives = len(train_set) - positives
+    criterion = nn.BCEWithLogitsLoss(
+        pos_weight=torch.tensor([negatives / max(positives, 1.0)], device=device)
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0003)
+    loader = DataLoader(
+        train_set, batch_size=batch_size, shuffle=True, num_workers=0,
+        generator=torch.Generator().manual_seed(SEED),
+        pin_memory=(device.type == "cuda")
+    )
 
-    data = pd.concat(samples, ignore_index=True)
+    print(f"\n--- {device.type.upper()} TRAINING ---", flush=True)
+    epoch_times = []
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    total_start = time.perf_counter()
 
-    print("\nTotal dataset sample:", len(data))
-    print("Labels:\n", data["Label"].value_counts())
+    for epoch in range(epochs):
+        model.train()
+        loss_total = torch.zeros((), device=device)
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        epoch_start = time.perf_counter()
+        for xb, yb in loader:
+            xb = xb.to(device, non_blocking=(device.type == "cuda"))
+            yb = yb.to(device, non_blocking=(device.type == "cuda"))
+            optimizer.zero_grad(set_to_none=True)
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+            loss_total += loss.detach()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - epoch_start
+        avg_loss = (loss_total / len(loader)).item()
+        if not np.isfinite(avg_loss):
+            raise RuntimeError(f"Non-finite loss during {device.type} training")
+        epoch_times.append(elapsed)
+        print(f"{device.type.upper()} | Epoch {epoch+1}/{epochs} | "
+              f"Loss {avg_loss:.5f} | {elapsed:.2f} sec", flush=True)
 
-    return data
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    # Training timer excludes test-time evaluation and CSV preprocessing.
+    total_seconds = time.perf_counter() - total_start
+    model.eval()
+    outputs = []
+    with torch.no_grad():
+        for xb, _ in DataLoader(test_set, batch_size=batch_size):
+            predicted = (torch.sigmoid(model(xb.to(device))) >= 0.5)
+            outputs.append(predicted.cpu().numpy().flatten())
+    prediction = np.concatenate(outputs)
+    actual = test_set.tensors[1].numpy().flatten()
+    result = {
+        "device": device.type.upper(),
+        "seconds": round(total_seconds, 3),
+        "minutes": round(total_seconds / 60, 3),
+        "accuracy": round(float(accuracy_score(actual, prediction)), 5),
+        "precision": round(float(precision_score(actual, prediction, zero_division=0)), 5),
+        "recall": round(float(recall_score(actual, prediction, zero_division=0)), 5),
+        "f1": round(float(f1_score(actual, prediction, zero_division=0)), 5),
+        "epoch_seconds": epoch_times,
+    }
+    print(f"{result['device']} training took {total_seconds/60:.2f} minutes | "
+          f"Accuracy {result['accuracy']*100:.2f}% | F1 {result['f1']*100:.2f}%", flush=True)
+    return result, model
+
+
+def save_comparison(cpu, gpu, info, epochs, batch_size):
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    cpu_time = cpu["seconds"]
+    gpu_time = gpu["seconds"] if gpu else None
+    speedup = cpu_time / gpu_time if gpu_time and gpu_time > 0 else None
+    results = [cpu] + ([gpu] if gpu else [])
+
+    rows = [{
+        "device": r["device"],
+        "samples": info["sampled_rows"],
+        "training_rows": info["training_rows"],
+        "features": info["feature_count"],
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "training_seconds": r["seconds"],
+        "training_minutes": r["minutes"],
+        "accuracy": r["accuracy"],
+        "precision": r["precision"],
+        "recall": r["recall"],
+        "f1": r["f1"],
+    } for r in results]
+    with open(RESULTS_DIR / "training_comparison.csv", "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    with open(RESULTS_DIR / "training_comparison.json", "w", encoding="utf-8") as file:
+        json.dump({"dataset": info, "epochs": epochs, "batch_size": batch_size,
+                   "cpu": cpu, "gpu": gpu, "gpu_speedup": speedup}, file, indent=2)
+
+    labels = [r["device"] for r in results]
+    seconds = [r["seconds"] for r in results]
+    fig, ax = plt.subplots(figsize=(7, 4))
+    bars = ax.bar(labels, [t / 60 for t in seconds])
+    ax.set_title(f"IDS Training: {info['sampled_rows']:,} rows, {epochs} epochs")
+    ax.set_ylabel("Actual training time (minutes)")
+    ax.set_ylim(0, max(seconds) / 60 * 1.20 if max(seconds) > 0 else 1)
+    for bar, sec in zip(bars, seconds):
+        ax.text(bar.get_x() + bar.get_width()/2, sec/60, f"{sec/60:.2f} min",
+                ha="center", va="bottom")
+    fig.tight_layout()
+    fig.savefig(RESULTS_DIR / "training_comparison.png", dpi=180)
+    plt.close(fig)
+
+    print("\n=========== TRAINING COMPARISON ===========")
+    print(f"Total sampled: {info['sampled_rows']:,} rows | Training: {info['training_rows']:,} "
+          f"| Features: {info['feature_count']} | Epochs: {epochs}")
+    print(f"CPU training time: {cpu_time:.2f} seconds ({cpu_time/60:.2f} min)")
+    if gpu:
+        print(f"GPU training time: {gpu_time:.2f} seconds ({gpu_time/60:.2f} min)")
+        print(f"GPU speedup: {speedup:.2f}x")
+    else:
+        print("CUDA unavailable: CPU-only result, no speedup")
+    print("Saved: results/training_comparison.csv, .json and .png")
 
 
 def main():
-    print("Device:", DEVICE)
+    parser = argparse.ArgumentParser(description="Compare real CPU and GPU IDS training times")
+    parser.add_argument("--epochs", type=int, default=25)
+    parser.add_argument("--batch-size", type=int, default=4096)
+    args = parser.parse_args()
+    if args.epochs < 1 or args.batch_size < 1:
+        parser.error("--epochs and --batch-size must be positive")
+
+    torch.manual_seed(SEED)
+    torch.set_num_threads(min(6, os.cpu_count() or 4))
+    train_set, test_set, info = load_prepared_data()
+    print(f"Prepared dataset: {info['sampled_rows']:,} rows "
+          f"({info['training_rows']:,} train, {info['testing_rows']:,} test)")
+    print(f"Real features: {info['feature_count']} | Batch size: {args.batch_size}")
+    print("Data preparation and testing are excluded from training times.")
+    initial = IDSNet(info["feature_count"]).state_dict()
+    initial = {key: val.detach().clone() for key, val in initial.items()}
+
+    cpu, cpu_model = train_on_device(
+        torch.device("cpu"), initial, train_set, test_set,
+        args.epochs, args.batch_size, info["feature_count"]
+    )
+    del cpu_model
+    gpu = None
     if torch.cuda.is_available():
         print("GPU:", torch.cuda.get_device_name(0))
-
-    data = load_sample()
-
-    X = data.drop(columns="Label").to_numpy(dtype=np.float32)
-    y = data["Label"].to_numpy(dtype=np.float32)
-
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y,
-        test_size=0.2,
-        random_state=42,
-        stratify=y
-    )
-    np.savez_compressed(
-    RESULTS_DIR / "test_data.npz",
-    X_test=X_test,
-    y_test=y_test
-)
-
-    # Clip extreme values using training data percentiles
-    lower = np.percentile(X_train, 1, axis=0)
-    upper = np.percentile(X_train, 99, axis=0)
-
-    np.savez(
-    MODEL_DIR / "clip_bounds.npz",
-    lower=lower,
-    upper=upper
-)
-
-    X_train = np.clip(X_train, lower, upper)
-    X_test = np.clip(X_test, lower, upper)
-
-    # Scale features
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_test = scaler.transform(X_test)
-
-    # Replace any remaining invalid values
-    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
-    X_test = np.nan_to_num(X_test, nan=0.0, posinf=0.0, neginf=0.0)
-
-    X_train = X_train.astype(np.float32)
-    X_test = X_test.astype(np.float32)
-
-    print("Scaled values valid:", np.isfinite(X_train).all())
-
-    train_dataset = TensorDataset(
-        torch.tensor(X_train),
-        torch.tensor(y_train).reshape(-1, 1)
-    )
-
-    test_dataset = TensorDataset(
-        torch.tensor(X_test),
-        torch.tensor(y_test).reshape(-1, 1)
-    )
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE, shuffle=True
-    )
-
-    test_loader = DataLoader(
-        test_dataset, batch_size=BATCH_SIZE
-    )
-
-    model = IDSModel(X_train.shape[1]).to(DEVICE)
-
-    positives = max(float(y_train.sum()), 1.0)
-    negatives = max(float(len(y_train) - y_train.sum()), 1.0)
-
-    pos_weight = torch.tensor(
-        [negatives / positives],
-        device=DEVICE
-    )
-
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
-
-    print("\nStarting training...")
-
-    for epoch in range(EPOCHS):
-        model.train()
-        total_loss = 0
-
-        for batch_X, batch_y in train_loader:
-            batch_X = batch_X.to(DEVICE)
-            batch_y = batch_y.to(DEVICE)
-
-            optimizer.zero_grad()
-
-            outputs = model(batch_X)
-            loss = criterion(outputs, batch_y)
-
-            if not torch.isfinite(loss):
-                print("Invalid loss detected. Stopping.")
-                return
-
-            loss.backward()
-
-            # Prevent exploding gradients
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            optimizer.step()
-            total_loss += loss.item()
-
-        avg_loss = total_loss / len(train_loader)
-        print(f"Epoch {epoch + 1}/{EPOCHS} | Loss: {avg_loss:.6f}")
-
-    # Evaluation
-    model.eval()
-    predictions = []
-    actual = []
-
-    with torch.no_grad():
-        for batch_X, batch_y in test_loader:
-            batch_X = batch_X.to(DEVICE)
-
-            outputs = model(batch_X)
-            preds = (torch.sigmoid(outputs) >= 0.5).int()
-
-            predictions.extend(preds.cpu().numpy().flatten())
-            actual.extend(batch_y.numpy().flatten())
-
-  
-   
-
-
-        print("\n--- TEST RESULTS ---")
-        print("Accuracy :", accuracy_score(actual, predictions))
-        print("Precision:", precision_score(actual, predictions, zero_division=0))
-        print("Recall   :", recall_score(actual, predictions, zero_division=0))
-        print("F1 Score:", f1_score(actual, predictions, zero_division=0))
-
-        # Confusion matrix
-        cm = confusion_matrix(actual, predictions, labels=[0, 1])
-
-        print("\n--- CONFUSION MATRIX ---")
-        print("                 Predicted")
-        print("              Benign  Attack")
-        print(f"Actual Benign   {cm[0][0]:>6}  {cm[0][1]:>6}")
-        print(f"Actual Attack   {cm[1][0]:>6}  {cm[1][1]:>6}")
-
-        # Plot confusion matrix
-        plt.figure(figsize=(6, 5))
-        plt.imshow(cm)
-        plt.title("GPU-ML-IDS Confusion Matrix")
-        plt.xticks([0, 1], ["Benign", "Attack"])
-        plt.yticks([0, 1], ["Benign", "Attack"])
-        plt.xlabel("Predicted Label")
-        plt.ylabel("Actual Label")
-
-        for i in range(2):
-            for j in range(2):
-                plt.text(j, i, str(cm[i, j]), ha="center", va="center")
-
-        plt.tight_layout()
-
-        cm_path = RESULTS_DIR / "confusion_matrix.png"
-        plt.savefig(cm_path, dpi=300)
-        plt.close()
-
-        print("Confusion matrix saved:", cm_path)
-
-        # Save model and scaler
-        torch.save(model.state_dict(), MODEL_DIR / "ids_model.pth")
-        joblib.dump(scaler, MODEL_DIR / "scaler.pkl")
-
-        print("\nModel saved successfully.")
-        print("Training completed!")
+        gpu, gpu_model = train_on_device(
+            torch.device("cuda"), initial, train_set, test_set,
+            args.epochs, args.batch_size, info["feature_count"]
+        )
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        torch.save({k: v.cpu() for k, v in gpu_model.state_dict().items()},
+                   MODELS_DIR / "ids_comparison_gpu.pth")
+    save_comparison(cpu, gpu, info, args.epochs, args.batch_size)
 
 
 if __name__ == "__main__":
